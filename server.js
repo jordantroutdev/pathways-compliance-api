@@ -1,8 +1,13 @@
 require('dotenv').config()
+const cors = require('cors')
 const sql = require('mssql')
 const express = require('express')
 const app = express()
 app.use(express.json())
+
+app.use(cors({
+	origin: 'https://orange-desert-0cac6391e.7.azurestaticapps.net'
+}))
 
 const dbConfig = {
   server: process.env.DB_SERVER,
