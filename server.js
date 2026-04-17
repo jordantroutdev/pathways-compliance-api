@@ -145,6 +145,7 @@ app.get('/api/compliance-issues', async (req, res) => {
         ci.status,
         ci.first_scraped_at,
         ci.last_seen_at,
+	ci.staff_id,
         s.office,
         s.email
       FROM compliance.compliance_issues ci
