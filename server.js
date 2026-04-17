@@ -157,6 +157,41 @@ app.get('/api/compliance-issues', async (req, res) => {
   }
 })
 
+app.get('/api/staff/:id/compliance-issues', async (req, res) => {
+  const staffId = parseInt(req.params.id);
+
+  if (isNaN(staffId)) {
+    return res.status(400).json({ error: 'Invalid staff ID' });
+  }
+
+  try {
+    const pool = await sql.connect(dbConfig);
+
+    // Query 1: fetch the staff record
+    const staffResult = await pool.request()
+      .input('id', sql.Int, staffId)
+      .query('SELECT id, full_name, office, job_title, email, phone, employment_status FROM compliance.staff WHERE id = @id');
+
+    if (staffResult.recordset.length === 0) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+
+    // Query 2: fetch all compliance issues for this staff member
+    const issuesResult = await pool.request()
+      .input('staff_id', sql.Int, staffId)
+      .query('SELECT id, category, issue_description, non_compliant_date, status FROM compliance.compliance_issues WHERE staff_id = @staff_id ORDER BY non_compliant_date DESC');
+
+    res.json({
+      staff: staffResult.recordset[0],
+      issues: issuesResult.recordset
+    });
+
+  } catch (err) {
+    console.error('Profile endpoint error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
 app.listen(3000, () => {
   console.log('Server running on port 3000')
 })
