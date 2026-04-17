@@ -6,7 +6,10 @@ const app = express()
 app.use(express.json())
 
 app.use(cors({
-	origin: 'https://orange-desert-0cac6391e.7.azurestaticapps.net'
+	origin: [
+	 'https://orange-desert-0cac6391e.7.azurestaticapps.net',
+	 'http://localhost:5173'
+	]
 }))
 
 const dbConfig = {
@@ -122,6 +125,33 @@ app.delete('/api/staff/:id', async (req, res) => {
       .input('id', sql.Int, req.params.id)
       .query('DELETE FROM compliance.staff WHERE id = @id')
     res.json({ message: 'Staff member deleted' })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── GET ALL COMPLIANCE ISSUES ─────────────────────────────
+app.get('/api/compliance-issues', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT 
+        ci.id,
+        ci.staff_name_raw,
+        ci.category,
+        ci.issue_description,
+        ci.non_compliant_date,
+        ci.supervisor_name_raw,
+        ci.status,
+        ci.first_scraped_at,
+        ci.last_seen_at,
+        s.office,
+        s.email
+      FROM compliance.compliance_issues ci
+      LEFT JOIN compliance.staff s ON ci.staff_id = s.id
+      ORDER BY ci.first_scraped_at DESC
+    `)
+    res.json(result.recordset)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
