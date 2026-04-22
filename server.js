@@ -23,6 +23,16 @@ const dbConfig = {
   }
 }
 
+// Keep Azure SQL connection alive
+setInterval(async () => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    await pool.request().query('SELECT 1')
+  } catch (err) {
+    console.error('Keep-alive ping failed:', err.message)
+  }
+}, 4 * 60 * 1000) // every 4 minutes
+
 // ── HEALTH CHECK ──────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   try {
@@ -192,6 +202,29 @@ app.get('/api/staff/:id/compliance-issues', async (req, res) => {
     res.status(500).json({ error: 'Database error' });
   }
 });
+
+app.patch('/api/compliance-issues/:id/resolve', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request()
+      .input('id', sql.Int, req.params.id)
+      .input('resolved_by', sql.NVarChar, 'Coordinator')
+      .query(`
+        UPDATE compliance.compliance_issues
+        SET status = 'resolved',
+            resolved_at = GETDATE(),
+            resolved_by = @resolved_by
+        OUTPUT INSERTED.*
+        WHERE id = @id
+      `)
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ error: 'Issue not found' })
+    }
+    res.json(result.recordset[0])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
 
 app.listen(3000, () => {
   console.log('Server running on port 3000')
