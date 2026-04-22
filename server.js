@@ -98,7 +98,7 @@ app.post('/api/staff', async (req, res) => {
 // ── UPDATE STAFF ──────────────────────────────────────────
 app.put('/api/staff/:id', async (req, res) => {
   try {
-    const { full_name, office, job_title, email, phone, employment_status } = req.body
+    const { full_name, office, job_title, email, phone, employment_status, preferred_contact, notes } = req.body
     const pool = await sql.connect(dbConfig)
     const result = await pool.request()
       .input('id', sql.Int, req.params.id)
@@ -108,6 +108,8 @@ app.put('/api/staff/:id', async (req, res) => {
       .input('email', sql.NVarChar, email)
       .input('phone', sql.NVarChar, phone)
       .input('employment_status', sql.NVarChar, employment_status)
+      .input('preferred_contact', sql.VarChar, preferred_contact || null)
+      .input('notes', sql.NVarChar, notes || null)
       .query(`UPDATE compliance.staff SET
         full_name = @full_name,
         office = @office,
@@ -115,6 +117,8 @@ app.put('/api/staff/:id', async (req, res) => {
         email = @email,
         phone = @phone,
         employment_status = @employment_status,
+        preferred_contact = @preferred_contact,
+        notes = @notes,
         updated_at = GETDATE()
         OUTPUT INSERTED.*
         WHERE id = @id`)
@@ -126,6 +130,7 @@ app.put('/api/staff/:id', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
 
 // ── DELETE STAFF ──────────────────────────────────────────
 app.delete('/api/staff/:id', async (req, res) => {
