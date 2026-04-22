@@ -3,6 +3,10 @@ const cors = require('cors')
 const sql = require('mssql')
 const express = require('express')
 const app = express()
+const { BlobServiceClient } = require('@azure/storage-blob')
+const { v4: uuidv4 } = require('uuid')
+const multer = require('multer')
+const upload = multer({ storage: multer.memoryStorage() })
 app.use(express.json())
 
 app.use(cors({
@@ -226,6 +230,135 @@ app.patch('/api/compliance-issues/:id/resolve', async (req, res) => {
       return res.status(404).json({ error: 'Issue not found' })
     }
     res.json(result.recordset[0])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── GENERATE SUBMISSION TOKEN ─────────────────────────────
+app.post('/api/submission-tokens', async (req, res) => {
+  try {
+    const { staff_id, issue_id } = req.body
+    const token = uuidv4()
+    const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+
+    const pool = await sql.connect(dbConfig)
+    await pool.request()
+      .input('token', sql.NVarChar, token)
+      .input('staff_id', sql.Int, staff_id)
+      .input('issue_id', sql.Int, issue_id)
+      .input('expires_at', sql.DateTime2, expires_at)
+      .query(`
+        INSERT INTO compliance.submission_tokens (token, staff_id, issue_id, expires_at)
+        VALUES (@token, @staff_id, @issue_id, @expires_at)
+      `)
+
+    res.json({ token, expires_at })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── VALIDATE SUBMISSION TOKEN ─────────────────────────────
+app.get('/api/submit/:token', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request()
+      .input('token', sql.NVarChar, req.params.token)
+      .query(`
+        SELECT
+          st.token,
+          st.expires_at,
+          st.used_at,
+          s.id as staff_id,
+          s.full_name,
+          s.email,
+          ci.id as issue_id,
+          ci.category,
+          ci.issue_description,
+          ci.non_compliant_date
+        FROM compliance.submission_tokens st
+        JOIN compliance.staff s ON st.staff_id = s.id
+        JOIN compliance.compliance_issues ci ON st.issue_id = ci.id
+        WHERE st.token = @token
+      `)
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ error: 'Invalid or expired link' })
+    }
+
+    const record = result.recordset[0]
+
+    if (record.used_at) {
+      return res.status(410).json({ error: 'This link has already been used' })
+    }
+
+    if (new Date(record.expires_at) < new Date()) {
+      return res.status(410).json({ error: 'This link has expired' })
+    }
+
+    res.json(record)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── SUBMIT DOCUMENT ───────────────────────────────────────
+app.post('/api/submit/:token', upload.single('document'), async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+
+    // Validate token first
+    const tokenResult = await pool.request()
+      .input('token', sql.NVarChar, req.params.token)
+      .query(`
+        SELECT * FROM compliance.submission_tokens
+        WHERE token = @token
+      `)
+
+    if (tokenResult.recordset.length === 0) {
+      return res.status(404).json({ error: 'Invalid link' })
+    }
+
+    const tokenRecord = tokenResult.recordset[0]
+
+    if (tokenRecord.used_at) {
+      return res.status(410).json({ error: 'This link has already been used' })
+    }
+
+    if (new Date(tokenRecord.expires_at) < new Date()) {
+      return res.status(410).json({ error: 'This link has expired' })
+    }
+
+    // Upload file to blob storage
+    const blobServiceClient = BlobServiceClient.fromConnectionString(process.env.STORAGE_CONNECTION_STRING)
+    const containerClient = blobServiceClient.getContainerClient('compliance-documents')
+
+    const blobName = `${tokenRecord.staff_id}/${tokenRecord.issue_id}/${Date.now()}-${req.file.originalname}`
+    const blockBlobClient = containerClient.getBlockBlobClient(blobName)
+
+    await blockBlobClient.uploadData(req.file.buffer, {
+      blobHTTPHeaders: { blobContentType: req.file.mimetype }
+    })
+
+    const documentUrl = blockBlobClient.url
+
+    // Mark token as used and update compliance issue
+    await pool.request()
+      .input('token', sql.NVarChar, req.params.token)
+      .input('used_at', sql.DateTime2, new Date())
+      .query(`UPDATE compliance.submission_tokens SET used_at = @used_at WHERE token = @token`)
+
+    await pool.request()
+      .input('issue_id', sql.Int, tokenRecord.issue_id)
+      .input('document_url', sql.NVarChar, documentUrl)
+      .query(`
+        UPDATE compliance.compliance_issues
+        SET document_url = @document_url, status = 'resolved', updated_at = GETDATE()
+        WHERE id = @issue_id
+      `)
+
+    res.json({ success: true, document_url: documentUrl })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
