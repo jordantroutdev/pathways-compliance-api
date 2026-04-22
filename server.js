@@ -1,10 +1,13 @@
+const { webcrypto } = require('crypto')
+globalThis.crypto = webcrypto
+
 require('dotenv').config()
 const cors = require('cors')
 const sql = require('mssql')
 const express = require('express')
 const app = express()
 const { BlobServiceClient } = require('@azure/storage-blob')
-const { v4: uuidv4 } = require('uuid')
+const { randomUUID } = require('crypto')
 const multer = require('multer')
 const upload = multer({ storage: multer.memoryStorage() })
 app.use(express.json())
@@ -239,7 +242,7 @@ app.patch('/api/compliance-issues/:id/resolve', async (req, res) => {
 app.post('/api/submission-tokens', async (req, res) => {
   try {
     const { staff_id, issue_id } = req.body
-    const token = uuidv4()
+    const token = randomUUID()
     const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
 
     const pool = await sql.connect(dbConfig)
