@@ -12,6 +12,12 @@ const upload = multer({ storage: multer.memoryStorage() })
 const app = express()
 app.use(express.json())
 
+const { EmailClient } = require('@azure/communication-email')
+const { SmsClient } = require('@azure/communication-sms')
+
+const emailClient = new EmailClient(process.env.ACS_CONNECTION_STRING)
+const smsClient = new SmsClient(process.env.ACS_CONNECTION_STRING)
+
 app.use(cors({
   origin: [
     'https://orange-desert-0cac6391e.7.azurestaticapps.net',
@@ -123,7 +129,9 @@ app.put('/api/staff/:id', async (req, res) => {
 app.delete('/api/staff/:id', async (req, res) => {
   try {
     const pool = await sql.connect(dbConfig)
-    await pool.request().input('id', sql.Int, req.params.id).query('DELETE FROM compliance.staff WHERE id = @id')
+    await pool.request()
+      .input('id', sql.Int, req.params.id)
+      .query('DELETE FROM compliance.staff WHERE id = @id')
     res.json({ message: 'Staff member deleted' })
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -250,8 +258,38 @@ app.post('/api/submit/:token', upload.single('document'), async (req, res) => {
     await pool.request()
       .input('issue_id', sql.Int, tokenRecord.issue_id)
       .input('document_url', sql.NVarChar, documentUrl)
-      .query(`UPDATE compliance.compliance_issues SET document_url=@document_url, status='resolved', updated_at=GETDATE() WHERE id=@issue_id`)
+      .query(`UPDATE compliance.compliance_issues SET document_url=@document_url, status='open', updated_at=GETDATE() WHERE id=@issue_id`)
     res.json({ success: true, document_url: documentUrl })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── GET COMMUNICATION PREFERENCES ────────────────────────
+app.get('/api/preferences/:staffId', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request()
+      .input('id', sql.Int, req.params.staffId)
+      .query('SELECT id, full_name, email, phone, preferred_contact FROM compliance.staff WHERE id = @id')
+    if (result.recordset.length === 0) return res.status(404).json({ error: 'Staff member not found' })
+    res.json(result.recordset[0])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── UPDATE COMMUNICATION PREFERENCES ─────────────────────
+app.post('/api/preferences/:staffId', async (req, res) => {
+  try {
+    const { preferred_contact } = req.body
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request()
+      .input('id', sql.Int, req.params.staffId)
+      .input('preferred_contact', sql.VarChar, preferred_contact)
+      .query(`UPDATE compliance.staff SET preferred_contact=@preferred_contact, updated_at=GETDATE() OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.email, INSERTED.phone, INSERTED.preferred_contact WHERE id=@id`)
+    if (result.recordset.length === 0) return res.status(404).json({ error: 'Staff member not found' })
+    res.json(result.recordset[0])
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -360,7 +398,7 @@ app.get('/api/communications/queue', async (req, res) => {
 // ── UPDATE QUEUE ITEM ─────────────────────────────────────
 app.put('/api/communications/queue/:id', async (req, res) => {
   try {
-    const { email_subject, email_body, sms_body, status } = req.body
+    const { email_subject, email_body, sms_body, status, channel } = req.body
     const pool = await sql.connect(dbConfig)
     const result = await pool.request()
       .input('id', sql.Int, req.params.id)
@@ -368,11 +406,269 @@ app.put('/api/communications/queue/:id', async (req, res) => {
       .input('email_body', sql.NVarChar, email_body)
       .input('sms_body', sql.NVarChar, sms_body)
       .input('status', sql.VarChar, status)
+      .input('channel', sql.VarChar, channel || 'email')
       .query(`UPDATE compliance.communication_queue
-        SET email_subject=@email_subject, email_body=@email_body, sms_body=@sms_body, status=@status,
+        SET email_subject=@email_subject, email_body=@email_body, sms_body=@sms_body,
+        status=@status, channel=@channel,
         approved_at=CASE WHEN @status='approved' THEN GETDATE() ELSE approved_at END
         OUTPUT INSERTED.* WHERE id=@id`)
     res.json(result.recordset[0])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DELETE QUEUE ITEM ─────────────────────────────────────
+app.delete('/api/communications/queue/:id', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    await pool.request()
+      .input('id', sql.Int, req.params.id)
+      .query('DELETE FROM compliance.communication_queue WHERE id = @id')
+    res.json({ message: 'Queue item deleted' })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── SEND COMMUNICATION ────────────────────────────────────
+app.patch('/api/communications/queue/:id/send', async (req, res) => {
+  try {
+    const { id } = req.params
+    const pool = await sql.connect(dbConfig)
+
+    const fetchResult = await pool.request()
+      .input('id', sql.Int, id)
+      .query(`
+        SELECT cq.id, cq.issue_id, cq.staff_id, cq.email_subject, cq.email_body,
+               cq.sms_body, cq.channel, cq.status,
+               s.id as staff_id_val, s.email AS staff_email, s.phone AS staff_phone, s.full_name,
+               ci.issue_description, ci.category
+        FROM compliance.communication_queue cq
+        JOIN compliance.staff s ON cq.staff_id = s.id
+        JOIN compliance.compliance_issues ci ON cq.issue_id = ci.id
+        WHERE cq.id = @id
+      `)
+
+    const item = fetchResult.recordset[0]
+    if (!item) return res.status(404).json({ error: 'Queue item not found' })
+    if (item.status !== 'approved') return res.status(400).json({ error: 'Item must be approved before sending' })
+
+    const token = randomUUID()
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+
+    await pool.request()
+      .input('token', sql.NVarChar, token)
+      .input('staff_id', sql.Int, item.staff_id)
+      .input('issue_id', sql.Int, item.issue_id)
+      .input('expires_at', sql.DateTime2, expiresAt)
+      .query('INSERT INTO compliance.submission_tokens (token, staff_id, issue_id, expires_at) VALUES (@token, @staff_id, @issue_id, @expires_at)')
+
+    const SWA_URL = 'https://orange-desert-0cac6391e.7.azurestaticapps.net'
+    const submissionLink = `${SWA_URL}/submit/${token}`
+    const preferencesLink = `${SWA_URL}/preferences/${item.staff_id}`
+
+    const emailBodyWithLink = `${item.email_body}\n\nSubmit your compliance document here:\n${submissionLink}\n\nManage your communication preferences:\n${preferencesLink}`
+    const smsBodyWithLink = `${item.sms_body}\nSubmit: ${submissionLink}\nPrefs: ${preferencesLink}`
+
+    const normalizePhone = (phone) => {
+      const digits = phone.replace(/\D/g, '')
+      return digits.length === 10 ? `+1${digits}` : `+${digits}`
+    }
+
+    if (item.channel === 'email' || item.channel === 'both') {
+      const emailMessage = {
+        senderAddress: process.env.ACS_SENDER_ADDRESS,
+        recipients: { to: [{ address: item.staff_email }] },
+        content: { subject: item.email_subject, plainText: emailBodyWithLink }
+      }
+      const poller = await emailClient.beginSend(emailMessage)
+      await poller.pollUntilDone()
+    }
+
+    if (item.channel === 'sms' || item.channel === 'both') {
+      await smsClient.send({
+        from: process.env.ACS_PHONE_NUMBER,
+        to: [normalizePhone(item.staff_phone)],
+        message: smsBodyWithLink
+      })
+    }
+
+    await pool.request()
+      .input('id', sql.Int, id)
+      .query(`UPDATE compliance.communication_queue SET status='sent', sent_at=GETDATE() WHERE id=@id`)
+
+    const channels = item.channel === 'both' ? ['email', 'sms'] : [item.channel]
+    for (const ch of channels) {
+      await pool.request()
+        .input('staff_id', sql.Int, item.staff_id)
+        .input('issue_id', sql.Int, item.issue_id)
+        .input('channel', sql.NVarChar, ch)
+        .input('recipient', sql.NVarChar, ch === 'email' ? item.staff_email : normalizePhone(item.staff_phone))
+        .input('message_body', sql.NVarChar, ch === 'email' ? emailBodyWithLink : smsBodyWithLink)
+        .input('sent_at', sql.DateTime2, new Date())
+        .query(`INSERT INTO compliance.alert_log (staff_id, compliance_issue_id, alert_type, channel, recipient, message_body, send_status, sent_at)
+          VALUES (@staff_id, @issue_id, 'compliance_notice', @channel, @recipient, @message_body, 'sent', @sent_at)`)
+    }
+
+    const updated = await pool.request()
+      .input('id', sql.Int, id)
+      .query(`
+        SELECT cq.*, s.full_name, s.email AS staff_email, s.phone AS staff_phone,
+               ci.issue_description, ci.category
+        FROM compliance.communication_queue cq
+        JOIN compliance.staff s ON cq.staff_id = s.id
+        JOIN compliance.compliance_issues ci ON cq.issue_id = ci.id
+        WHERE cq.id = @id
+      `)
+
+    res.json(updated.recordset[0])
+  } catch (err) {
+    console.error('Send error:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DASHBOARD HOME STATS ──────────────────────────────────
+app.get('/api/dashboard/home-stats', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT
+        (SELECT COUNT(*) FROM compliance.compliance_issues WHERE status = 'open') as open_issues,
+        (SELECT COUNT(*) FROM compliance.alert_log al
+          JOIN compliance.compliance_issues ci ON al.compliance_issue_id = ci.id
+          WHERE al.send_status = 'sent' AND ci.status = 'open' AND al.alert_type = 'compliance_notice') as pending_communications,
+        (SELECT COUNT(*) FROM compliance.compliance_issues ci
+          WHERE ci.status = 'open' AND ci.staff_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM compliance.alert_log al WHERE al.compliance_issue_id = ci.id)) as needs_communication,
+        (SELECT COUNT(*) FROM compliance.compliance_issues
+          WHERE status = 'resolved' AND resolved_at >= DATEADD(hour, -24, GETDATE())) as resolved_today
+    `)
+    res.json(result.recordset[0])
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DASHBOARD SUMMARY ─────────────────────────────────────
+app.get('/api/dashboard/summary', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT
+        (SELECT COUNT(*) FROM compliance.compliance_issues WHERE status = 'open') as open_issues,
+        (SELECT COUNT(*) FROM compliance.staff WHERE employment_status = 'active') as total_staff,
+        (SELECT COUNT(*) FROM compliance.compliance_issues WHERE status = 'resolved') as resolved_issues,
+        (SELECT COUNT(*) FROM compliance.compliance_issues) as total_issues,
+        (SELECT COUNT(*) FROM compliance.alert_log WHERE send_status = 'sent') as total_alerts_sent
+    `)
+    const row = result.recordset[0]
+    const compliance_rate = row.total_issues > 0 ? Math.round((row.resolved_issues / row.total_issues) * 100) : 0
+    res.json({ ...row, compliance_rate })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DASHBOARD BY OFFICE ───────────────────────────────────
+app.get('/api/dashboard/by-office', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT
+        s.office,
+        COUNT(ci.id) as total_issues,
+        SUM(CASE WHEN ci.status = 'open' THEN 1 ELSE 0 END) as open_issues,
+        SUM(CASE WHEN ci.status = 'resolved' THEN 1 ELSE 0 END) as resolved_issues,
+        CASE WHEN COUNT(ci.id) > 0
+          THEN ROUND(CAST(SUM(CASE WHEN ci.status = 'resolved' THEN 1 ELSE 0 END) AS FLOAT) / COUNT(ci.id) * 100, 1)
+          ELSE 100
+        END as compliance_rate
+      FROM compliance.compliance_issues ci
+      JOIN compliance.staff s ON ci.staff_id = s.id
+      WHERE s.office IS NOT NULL
+      GROUP BY s.office
+      ORDER BY open_issues DESC
+    `)
+    res.json(result.recordset)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DASHBOARD BY CATEGORY ─────────────────────────────────
+app.get('/api/dashboard/by-category', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT
+        category,
+        COUNT(*) as total_issues,
+        SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_issues,
+        SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved_issues
+      FROM compliance.compliance_issues
+      GROUP BY category
+      ORDER BY open_issues DESC
+    `)
+    res.json(result.recordset)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DASHBOARD ALERT ACTIVITY ──────────────────────────────
+app.get('/api/dashboard/alert-activity', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT TOP 100
+        al.id, al.alert_type, al.channel, al.recipient,
+        al.send_status, al.sent_at, al.created_at,
+        s.full_name, s.office,
+        ci.issue_description, ci.category
+      FROM compliance.alert_log al
+      JOIN compliance.staff s ON al.staff_id = s.id
+      JOIN compliance.compliance_issues ci ON al.compliance_issue_id = ci.id
+      ORDER BY al.created_at DESC
+    `)
+    res.json(result.recordset)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DOCUMENTS PENDING ─────────────────────────────────────
+app.get('/api/documents/pending', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT ci.id, ci.staff_id, s.full_name, s.office, ci.issue_description,
+        ci.category, ci.document_url, ci.status, ci.updated_at
+      FROM compliance.compliance_issues ci
+      JOIN compliance.staff s ON ci.staff_id = s.id
+      WHERE ci.document_url IS NOT NULL AND ci.status = 'open'
+      ORDER BY ci.updated_at DESC
+    `)
+    res.json(result.recordset)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── DOCUMENTS ARCHIVED ────────────────────────────────────
+app.get('/api/documents/archived', async (req, res) => {
+  try {
+    const pool = await sql.connect(dbConfig)
+    const result = await pool.request().query(`
+      SELECT ci.id, ci.staff_id, s.full_name, s.office, ci.issue_description,
+        ci.category, ci.document_url, ci.status, ci.updated_at
+      FROM compliance.compliance_issues ci
+      JOIN compliance.staff s ON ci.staff_id = s.id
+      WHERE ci.document_url IS NOT NULL AND ci.status = 'resolved'
+      ORDER BY ci.updated_at DESC
+    `)
+    res.json(result.recordset)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
