@@ -8,8 +8,6 @@ const express = require('express')
 const { BlobServiceClient } = require('@azure/storage-blob')
 const { randomUUID } = require('crypto')
 const multer = require('multer')
-const bcrypt = require('bcrypt')
-const jwt = require('jsonwebtoken')
 const upload = multer({ storage: multer.memoryStorage() })
 const app = express()
 app.use(express.json())
@@ -50,119 +48,6 @@ app.get('/api/health', async (req, res) => {
     const pool = await sql.connect(dbConfig)
     const result = await pool.request().query('SELECT 1 AS connected')
     res.json({ status: 'ok', db: result.recordset[0] })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// ── AUTH: BOOTSTRAP FIRST USER (only works when 0 users exist) ───────────────
-app.post('/api/auth/bootstrap', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const check = await pool.request().query('SELECT COUNT(*) as cnt FROM compliance.users')
-    if (check.recordset[0].cnt > 0) return res.status(403).json({ error: 'Bootstrap disabled — users already exist.' })
-    const { full_name, email, password } = req.body
-    if (!full_name || !email || !password) return res.status(400).json({ error: 'full_name, email, and password are required.' })
-    const hash = await bcrypt.hash(password, 10)
-    const result = await pool.request()
-      .input('full_name', sql.NVarChar, full_name)
-      .input('email', sql.NVarChar, email)
-      .input('hash', sql.NVarChar, hash)
-      .query(`INSERT INTO compliance.users (full_name, email, password_hash, role)
-              OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.email, INSERTED.role
-              VALUES (@full_name, @email, @hash, 'coordinator')`)
-    res.json({ message: 'Coordinator account created. You can now log in.', user: result.recordset[0] })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// ── AUTH: LOGIN ───────────────────────────────────────────
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('email', sql.NVarChar, email)
-      .query('SELECT * FROM compliance.users WHERE email = @email AND is_active = 1')
-    const user = result.recordset[0]
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' })
-    const valid = await bcrypt.compare(password, user.password_hash)
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' })
-    await pool.request()
-      .input('id', sql.Int, user.id)
-      .query('UPDATE compliance.users SET last_login = GETUTCDATE() WHERE id = @id')
-    const token = jwt.sign(
-      { id: user.id, name: user.full_name, email: user.email, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '8h' }
-    )
-    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role } })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// ── USER MANAGEMENT ───────────────────────────────────────
-app.get('/api/users', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .query('SELECT id, full_name, email, role, is_active, last_login FROM compliance.users ORDER BY full_name')
-    res.json(result.recordset)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.post('/api/users', async (req, res) => {
-  try {
-    const { full_name, email, password, role } = req.body
-    const hash = await bcrypt.hash(password, 10)
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('full_name', sql.NVarChar, full_name)
-      .input('email', sql.NVarChar, email)
-      .input('hash', sql.NVarChar, hash)
-      .input('role', sql.NVarChar, role || 'reader')
-      .query(`INSERT INTO compliance.users (full_name, email, password_hash, role)
-              OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.email, INSERTED.role
-              VALUES (@full_name, @email, @hash, @role)`)
-    res.status(201).json(result.recordset[0])
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.put('/api/users/:id', async (req, res) => {
-  try {
-    const { full_name, email, password, role } = req.body
-    const pool = await sql.connect(dbConfig)
-    const req2 = pool.request()
-      .input('id', sql.Int, req.params.id)
-      .input('full_name', sql.NVarChar, full_name)
-      .input('email', sql.NVarChar, email)
-      .input('role', sql.NVarChar, role)
-    let q = 'UPDATE compliance.users SET full_name=@full_name, email=@email, role=@role'
-    if (password) {
-      req2.input('hash', sql.NVarChar, await bcrypt.hash(password, 10))
-      q += ', password_hash=@hash'
-    }
-    q += ' OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.email, INSERTED.role WHERE id=@id'
-    const result = await req2.query(q)
-    res.json(result.recordset[0])
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.patch('/api/users/:id/deactivate', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    await pool.request()
-      .input('id', sql.Int, req.params.id)
-      .query('UPDATE compliance.users SET is_active = 0 WHERE id = @id')
-    res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -279,7 +164,7 @@ app.get('/api/staff/:id/compliance-issues', async (req, res) => {
     const pool = await sql.connect(dbConfig)
     const staffResult = await pool.request()
       .input('id', sql.Int, staffId)
-      .query('SELECT id, full_name, office, job_title, email, phone, employment_status, preferred_contact FROM compliance.staff WHERE id = @id')
+      .query('SELECT id, full_name, office, job_title, email, phone, employment_status FROM compliance.staff WHERE id = @id')
     if (staffResult.recordset.length === 0) return res.status(404).json({ error: 'Staff member not found' })
     const issuesResult = await pool.request()
       .input('staff_id', sql.Int, staffId)
@@ -287,45 +172,6 @@ app.get('/api/staff/:id/compliance-issues', async (req, res) => {
     res.json({ staff: staffResult.recordset[0], issues: issuesResult.recordset })
   } catch (err) {
     res.status(500).json({ error: 'Database error' })
-  }
-})
-
-// ── GET STAFF COMMUNICATIONS (for profile tab) ────────────
-app.get('/api/staff/:id/communications', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('staff_id', sql.Int, req.params.id)
-      .query(`
-        SELECT cq.id, cq.channel, cq.status, cq.generated_at,
-               cq.email_subject, cq.email_body, cq.sms_body,
-               ci.issue_description, ci.category
-        FROM compliance.communication_queue cq
-        JOIN compliance.compliance_issues ci ON cq.issue_id = ci.id
-        WHERE cq.staff_id = @staff_id
-        ORDER BY cq.generated_at DESC
-      `)
-    res.json(result.recordset)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// ── GET STAFF DOCUMENTS (for profile tab) ─────────────────
-app.get('/api/documents/staff/:id', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('staff_id', sql.Int, req.params.id)
-      .query(`
-        SELECT id, issue_description, category, document_url, status, updated_at
-        FROM compliance.compliance_issues
-        WHERE staff_id = @staff_id AND document_url IS NOT NULL
-        ORDER BY updated_at DESC
-      `)
-    res.json(result.recordset)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
   }
 })
 
@@ -388,7 +234,7 @@ app.get('/api/submit/:token', async (req, res) => {
   }
 })
 
-// ── SUBMIT DOCUMENT (via token link) ─────────────────────
+// ── SUBMIT DOCUMENT ───────────────────────────────────────
 app.post('/api/submit/:token', upload.single('document'), async (req, res) => {
   try {
     const pool = await sql.connect(dbConfig)
@@ -419,25 +265,6 @@ app.post('/api/submit/:token', upload.single('document'), async (req, res) => {
   }
 })
 
-// ── PUBLIC DOCUMENT SUBMISSION (from website form) ────────
-app.post('/api/document-submissions', upload.single('document'), async (req, res) => {
-  try {
-    const { full_name, email, phone, office, message } = req.body
-    let document_url = null
-    if (req.file) {
-      const blobServiceClient = BlobServiceClient.fromConnectionString(process.env.STORAGE_CONNECTION_STRING)
-      const containerClient = blobServiceClient.getContainerClient('compliance-documents')
-      const blobName = `public-submissions/${Date.now()}-${req.file.originalname}`
-      const blockBlobClient = containerClient.getBlockBlobClient(blobName)
-      await blockBlobClient.uploadData(req.file.buffer, { blobHTTPHeaders: { blobContentType: req.file.mimetype } })
-      document_url = blockBlobClient.url
-    }
-    res.json({ success: true, document_url })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
 // ── GET COMMUNICATION PREFERENCES ────────────────────────
 app.get('/api/preferences/:staffId', async (req, res) => {
   try {
@@ -460,9 +287,7 @@ app.post('/api/preferences/:staffId', async (req, res) => {
     const result = await pool.request()
       .input('id', sql.Int, req.params.staffId)
       .input('preferred_contact', sql.VarChar, preferred_contact)
-      .query(`UPDATE compliance.staff SET preferred_contact=@preferred_contact, updated_at=GETDATE()
-              OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.email, INSERTED.phone, INSERTED.preferred_contact
-              WHERE id=@id`)
+      .query(`UPDATE compliance.staff SET preferred_contact=@preferred_contact, updated_at=GETDATE() OUTPUT INSERTED.id, INSERTED.full_name, INSERTED.email, INSERTED.phone, INSERTED.preferred_contact WHERE id=@id`)
     if (result.recordset.length === 0) return res.status(404).json({ error: 'Staff member not found' })
     res.json(result.recordset[0])
   } catch (err) {
@@ -558,8 +383,7 @@ app.get('/api/communications/queue', async (req, res) => {
     const result = await pool.request().query(`
       SELECT cq.id, cq.issue_id, cq.staff_id, cq.email_subject, cq.email_body,
         cq.sms_body, cq.channel, cq.status, cq.generated_at, cq.approved_at, cq.sent_at,
-        s.full_name, s.email, s.phone, s.office, s.preferred_contact,
-        ci.category, ci.issue_description
+        s.full_name, s.email, s.phone, s.office, ci.category, ci.issue_description
       FROM compliance.communication_queue cq
       JOIN compliance.staff s ON cq.staff_id = s.id
       JOIN compliance.compliance_issues ci ON cq.issue_id = ci.id
@@ -618,7 +442,7 @@ app.patch('/api/communications/queue/:id/send', async (req, res) => {
       .query(`
         SELECT cq.id, cq.issue_id, cq.staff_id, cq.email_subject, cq.email_body,
                cq.sms_body, cq.channel, cq.status,
-               s.email AS staff_email, s.phone AS staff_phone, s.full_name,
+               s.id as staff_id_val, s.email AS staff_email, s.phone AS staff_phone, s.full_name,
                ci.issue_description, ci.category
         FROM compliance.communication_queue cq
         JOIN compliance.staff s ON cq.staff_id = s.id
@@ -701,257 +525,6 @@ app.patch('/api/communications/queue/:id/send', async (req, res) => {
     res.json(updated.recordset[0])
   } catch (err) {
     console.error('Send error:', err)
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// ── MESSAGE CENTER ────────────────────────────────────────
-// Returns all staff as thread list, with last sent communication info
-app.get('/api/messages/threads', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request().query(`
-      SELECT
-        s.id, s.full_name, s.office, s.preferred_contact,
-        (SELECT TOP 1 LEFT(cq2.email_body, 80)
-         FROM compliance.communication_queue cq2
-         WHERE cq2.staff_id = s.id AND cq2.status = 'sent'
-         ORDER BY cq2.sent_at DESC) AS lastMessage,
-        (SELECT TOP 1 cq3.sent_at
-         FROM compliance.communication_queue cq3
-         WHERE cq3.staff_id = s.id AND cq3.status = 'sent'
-         ORDER BY cq3.sent_at DESC) AS lastTimestamp,
-        0 AS unread
-      FROM compliance.staff s
-      WHERE s.employment_status = 'active'
-      ORDER BY lastTimestamp DESC, s.full_name ASC
-    `)
-    res.json(result.recordset)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// Returns message thread for a staff member (sent comms as outbound messages)
-app.get('/api/messages/thread/:staffId', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('staff_id', sql.Int, req.params.staffId)
-      .query(`
-        SELECT
-          cq.id,
-          'outbound' AS direction,
-          cq.channel,
-          COALESCE(cq.email_body, cq.sms_body, '') AS content,
-          'Coordinator' AS sender_name,
-          cq.sent_at AS timestamp
-        FROM compliance.communication_queue cq
-        WHERE cq.staff_id = @staff_id AND cq.status = 'sent'
-        ORDER BY cq.sent_at ASC
-      `)
-    res.json(result.recordset)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// Send a direct message to a staff member
-app.post('/api/messages/send', async (req, res) => {
-  try {
-    const { staff_id, channel, content } = req.body
-    const pool = await sql.connect(dbConfig)
-    const staffResult = await pool.request()
-      .input('id', sql.Int, staff_id)
-      .query('SELECT full_name, email, phone FROM compliance.staff WHERE id = @id')
-    if (staffResult.recordset.length === 0) return res.status(404).json({ error: 'Staff not found' })
-    const staff = staffResult.recordset[0]
-
-    const normalizePhone = (phone) => {
-      const digits = phone.replace(/\D/g, '')
-      return digits.length === 10 ? `+1${digits}` : `+${digits}`
-    }
-
-    if ((channel === 'email' || channel === 'both') && staff.email) {
-      const poller = await emailClient.beginSend({
-        senderAddress: process.env.ACS_SENDER_ADDRESS,
-        recipients: { to: [{ address: staff.email }] },
-        content: { subject: 'Message from Pathways Compliance', plainText: content }
-      })
-      await poller.pollUntilDone()
-    }
-
-    if ((channel === 'sms' || channel === 'both') && staff.phone) {
-      await smsClient.send({
-        from: process.env.ACS_PHONE_NUMBER,
-        to: [normalizePhone(staff.phone)],
-        message: content
-      })
-    }
-
-    res.json({ id: Date.now(), direction: 'outbound', channel, content, sender_name: 'Coordinator', timestamp: new Date().toISOString() })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// ── NOTIFICATIONS (derived from recent activity) ──────────
-app.get('/api/notifications', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request().query(`
-      SELECT TOP 10
-        cq.id,
-        'communication_sent' AS type,
-        'Communication Sent' AS title,
-        CONCAT('Message sent to ', s.full_name) AS body,
-        cq.sent_at AS timestamp,
-        1 AS [read],
-        cq.staff_id
-      FROM compliance.communication_queue cq
-      JOIN compliance.staff s ON cq.staff_id = s.id
-      WHERE cq.status = 'sent' AND cq.sent_at >= DATEADD(day, -7, GETDATE())
-      ORDER BY cq.sent_at DESC
-    `)
-    res.json(result.recordset)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.patch('/api/notifications/:id/read', async (req, res) => {
-  res.json({ success: true })
-})
-
-app.patch('/api/notifications/read-all', async (req, res) => {
-  res.json({ success: true })
-})
-
-// ── TRAINING CENTER ───────────────────────────────────────
-// Requires these tables first — run in Azure SQL:
-//
-// CREATE TABLE compliance.training_courses (
-//   id INT IDENTITY(1,1) PRIMARY KEY,
-//   title NVARCHAR(200) NOT NULL,
-//   description NVARCHAR(MAX),
-//   instructor NVARCHAR(200),
-//   is_active BIT NOT NULL DEFAULT 1,
-//   created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE()
-// );
-// CREATE TABLE compliance.training_sessions (
-//   id INT IDENTITY(1,1) PRIMARY KEY,
-//   course_id INT NOT NULL REFERENCES compliance.training_courses(id),
-//   date DATE NOT NULL,
-//   time TIME NOT NULL,
-//   spots_total INT NOT NULL DEFAULT 20,
-//   spots_taken INT NOT NULL DEFAULT 0,
-//   created_at DATETIME2 NOT NULL DEFAULT GETUTCDATE()
-// );
-
-app.get('/api/training/courses', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .query('SELECT * FROM compliance.training_courses ORDER BY title')
-    res.json(result.recordset)
-  } catch (err) {
-    res.json([])
-  }
-})
-
-app.post('/api/training/courses', async (req, res) => {
-  try {
-    const { title, description, instructor } = req.body
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('title', sql.NVarChar, title)
-      .input('description', sql.NVarChar, description || null)
-      .input('instructor', sql.NVarChar, instructor || null)
-      .query(`INSERT INTO compliance.training_courses (title, description, instructor)
-              OUTPUT INSERTED.* VALUES (@title, @description, @instructor)`)
-    res.status(201).json(result.recordset[0])
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.put('/api/training/courses/:id', async (req, res) => {
-  try {
-    const { title, description, instructor, is_active } = req.body
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('id', sql.Int, req.params.id)
-      .input('title', sql.NVarChar, title)
-      .input('description', sql.NVarChar, description || null)
-      .input('instructor', sql.NVarChar, instructor || null)
-      .input('is_active', sql.Bit, is_active !== undefined ? is_active : true)
-      .query(`UPDATE compliance.training_courses
-              SET title=@title, description=@description, instructor=@instructor, is_active=@is_active
-              OUTPUT INSERTED.* WHERE id=@id`)
-    res.json(result.recordset[0])
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.delete('/api/training/courses/:id', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    await pool.request()
-      .input('id', sql.Int, req.params.id)
-      .query('DELETE FROM compliance.training_courses WHERE id = @id')
-    res.json({ success: true })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.get('/api/training/sessions', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request().query(`
-      SELECT ts.id, ts.course_id, tc.title AS course_title, tc.description, tc.instructor,
-             CONVERT(VARCHAR(10), ts.date, 120) AS date,
-             CONVERT(VARCHAR(5), ts.time, 108) AS time,
-             ts.spots_total, ts.spots_taken
-      FROM compliance.training_sessions ts
-      JOIN compliance.training_courses tc ON ts.course_id = tc.id
-      WHERE ts.date >= CAST(GETDATE() AS DATE)
-      ORDER BY ts.date ASC, ts.time ASC
-    `)
-    res.json(result.recordset)
-  } catch (err) {
-    res.json([])
-  }
-})
-
-app.post('/api/training/sessions', async (req, res) => {
-  try {
-    const { course_id, date, time, spots_total } = req.body
-    const pool = await sql.connect(dbConfig)
-    const result = await pool.request()
-      .input('course_id', sql.Int, course_id)
-      .input('date', sql.Date, date)
-      .input('time', sql.NVarChar, time)
-      .input('spots_total', sql.Int, spots_total || 20)
-      .query(`INSERT INTO compliance.training_sessions (course_id, date, time, spots_total)
-              OUTPUT INSERTED.* VALUES (@course_id, @date, @time, @spots_total)`)
-    res.status(201).json(result.recordset[0])
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
-app.post('/api/training/sessions/:id/signup', async (req, res) => {
-  try {
-    const pool = await sql.connect(dbConfig)
-    await pool.request()
-      .input('id', sql.Int, req.params.id)
-      .query(`UPDATE compliance.training_sessions
-              SET spots_taken = spots_taken + 1
-              WHERE id = @id AND spots_taken < spots_total`)
-    res.json({ success: true })
-  } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
